@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2018 Canonical Ltd
+
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# A copy of the GNU General Public License version 2 is in LICENSE.
+
+import argparse
+from collections import defaultdict, OrderedDict
+import itertools
+import os
+import re
+from urllib.request import urlopen
+import urllib.error
+
+import attr
+from jinja2 import Environment, FileSystemLoader
+import yaml
+import lzma
+
+env = Environment(
+    loader=FileSystemLoader(os.path.dirname(os.path.abspath(__file__)) + '/templates'),
+    autoescape=True,
+    extensions=['jinja2.ext.i18n'],
+)
+env.install_null_translations(True)
+
+def setup_yaml():
+    """ http://stackoverflow.com/a/8661021 """
+    represent_dict_order = (
+        lambda self, data: self.represent_mapping('tag:yaml.org,2002:map',
+                                                  data.items()))
+    yaml.add_representer(OrderedDict, represent_dict_order)
+
+
+setup_yaml()
+
+name_to_id = re.compile('[^0-9a-zA-Z]+')
+
+def as_data(inst):
+    r = OrderedDict()
+    fields = [field.name for field in attr.fields(type(inst))]
+    fields.extend(getattr(inst, "extra_fields", []))
+    for field in fields:
+        if field.startswith('_'):
+            continue
+        v = getattr(
+            inst,
+            'serialize_' + field,
+            lambda: getattr(inst, field))()
+        if v is not None:
+            r[field] = v
+    return r
+
+@attr.s
+class TestArchRegression:
+    arch = attr.ib(default=None)
+    log_link = attr.ib(default=None)
+    hist_link = attr.ib(default=None)
+
+
+@attr.s
+class TestRegression:
+    package = attr.ib(default=None) # source package name doing the blocking
+    version = attr.ib(default=None) # version that regressed
+    arches = attr.ib(default=None) # [TestArchRegression]
+
+    def serialize_arches(self):
+        return [as_data(a) for a in self.arches]
+
+    @property
+    def package_version(self):
+        return self.package + '/' + self.version
+
+@attr.s
+class PackageMigration:
+    source_package_name = attr.ib(default=None) # name of package that's in proposed
+    component = attr.ib(default=None) # main universe restricted multiverse
+    new_version = attr.ib(default=None) # 
+    old_version = attr.ib(default=None) # 
+    blocked_by = attr.ib(default=None) # [packages blocking source_package_name]
+    migrate_after = attr.ib(default=None) # [packages that must migrate before source_package_name]
+    regressions = attr.ib(default=None) # [Regression]
+    waiting = attr.ib(default=None) # {package: [arches]}
+    unsatdepends = attr.ib(default=None) # [string]
+    unsatbuilddep = attr.ib(default=None) # [string]
+    brokenbin = attr.ib(default=None) # [string]
+    componentmismatch = attr.ib(default=None) # [string]
+    reason = attr.ib(default=None) # [string]
+    migration_policy_verdict = attr.ib(default=None) # 
+
+    _age = attr.ib(default=None)
+
+    extra_fields = ['age']
+
+    def serialize_regressions(self):
+        return [as_data(r) for r in self.regressions]
+
+    @property
+    def late(self):
+        return self.age > 3
+
+    @property
+    def age(self):
+        if self._age is not None:
+            return self._age
+        else:
+            try:
+                return self.data["policy_info"]["age"]["current-age"]
+            except KeyError:
+                return -1
+
+    @age.setter
+    def age(self, val):
+        self._age = val
+
+    @property
+    def key_package(self):
+        return self.source_package_name
+
+
+def toid(name):
+    return name_to_id.sub("_", name)
+
+
+def write_package_migration(pm,fp):
+    attr = ["label=\"{}\n{}\n{}\"".format(pm.source_package_name, pm.old_version, pm.new_version)]
+    styles = []
+    if pm.migration_policy_verdict == "REJECTED_PERMANENTLY":
+        attr.append("shape=box")
+    if styles:
+        attr.append("style={}".format(",".join(styles)))
+    fp.write("  \"{}\" [{}];\n".format(toid(pm.source_package_name), ",".join(attr)))
+    for blocked_by in pm.blocked_by:
+        fp.write("  \"{}\" -> \"{}\" [label=\"blocked by\",style=bold];\n".format(toid(pm.source_package_name), toid(blocked_by)))
+    for after in pm.migrate_after:
+        fp.write("  \"{}\" -> \"{}\" [label=\"after\",style=dotted];\n".format(toid(pm.source_package_name), toid(after)))
+    for regression,arches in pm.regressions.items():
+        fp.write("  \"{}\" [label=\"{}\",style=dashed,shape=octagon];\n".format(toid(regression),regression.replace("/","\n")))
+        fp.write("  \"{}\" -> \"{}\" [label=\"{}\",style=dashed,shape=none];\n".format(toid(pm.source_package_name), toid(regression), ",".join(arches)))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ppa', action='store')
+    parser.add_argument('--components', action='store', default="main,restricted")
+    parser.add_argument('--excuses-yaml', action='store')
+    parser.add_argument('--packages', action='store', default=None)
+    parser.add_argument('--small-group-size', action='store', type=int, default=4)
+    parser.add_argument('output')
+    args = parser.parse_args()
+
+    components = args.components.split(',')
+    filter_packages = args.packages.split(',') if args.packages else []
+
+    print("fetching yaml")
+    if args.excuses_yaml:
+        if args.excuses_yaml.endswith('.xz'):
+            yaml_text = lzma.open(args.excuses_yaml)
+        else:
+            yaml_text = open(args.excuses_yaml)
+    else:
+        try:
+            yaml_text = lzma.open(urlopen("https://people.canonical.com/~ubuntu-archive/proposed-migration/update_excuses.yaml.xz"))
+        except urllib.error.HTTPError as e:
+            print("Reading fallback yaml (%s)" % e)
+            yaml_text = urlopen("https://people.canonical.com/~ubuntu-archive/proposed-migration/update_excuses.yaml")
+    print("parsing yaml")
+    # The CSafeLoader is ten times faster than the regular one
+    excuses = yaml.load(yaml_text, Loader=yaml.CSafeLoader)
+
+    print("pre-processing packages")
+    package_sets = []
+    migrations = {}
+    for item in excuses["sources"]:
+        source_package_name = item['item-name']
+        # Missing component means main
+        component = item.get('component', 'main')
+        new_version = item['new-version']
+        old_version = item['old-version']
+        reason = item['reason']
+        migration_policy_verdict = item['migration-policy-verdict']
+        if component not in components:
+            continue
+        if migration_policy_verdict not in ('REJECTED_PERMANENTLY','REJECTED_BLOCKED_BY_ANOTHER_ITEM','REJECTED_NEEDS_APPROVAL'):
+            continue
+        pm = PackageMigration(source_package_name=source_package_name, component=component,new_version=new_version, old_version=old_version, reason=reason, migration_policy_verdict=migration_policy_verdict)
+        migrations[source_package_name] = pm
+        pm.blocked_by = []
+        pm.migrate_after = []
+        pm.regressions = defaultdict(list)
+        pm.waiting = defaultdict(list)
+        pm.componentmismatch = []
+        # Process blocked-by
+        if 'dependencies' in item and 'blocked-by' in item['dependencies']:
+            pm.blocked_by = item['dependencies']['blocked-by']
+        # Process migrate-after
+        if 'dependencies' in item and 'migrate-after' in item['dependencies']:
+            pm.migrate_after = item['dependencies']['migrate-after']
+        # The verdict entries are not items to list on the report
+        if 'autopkgtest' in item['reason']:
+            for packageversion, results in sorted(item['policy_info']['autopkgtest'].items()):
+                if packageversion == "verdict":
+                    continue
+                regr_arches = []
+                for arch, result in sorted(results.items()):
+                    outcome, log, history, wtf1, wtf2 = result
+                    if outcome == "REGRESSION":
+                        regr_arches.append(TestArchRegression(arch=arch, log_link=log, hist_link=history))
+                        pm.regressions[packageversion].append(arch)
+                    if outcome == "RUNNING":
+                        pm.waiting[packageversion].append(arch)
+                #if regr_arches:
+                    #p, v = packageversion.split('/')
+                    #regr = TestRegression(package=p, version=v)
+                    #regr.arches = regr_arches
+                    #pm.regressions.append(regr)
+        if 'depends' in item['reason']:
+            for l in item['excuses']:
+                if 'cannot depend on' in l:
+                    pm.componentmismatch.append(l)
+        if 'dependencies' in item and 'unsatisfiable-dependencies' in item['dependencies']:
+            pm.unsatdepends = defaultdict(list)
+            for arch, packages in item['dependencies']['unsatisfiable-dependencies'].items():
+                for p in packages:
+                    pm.unsatdepends[p].append(arch)
+        if 'build-depends' in item['policy_info'] and 'unsatisfiable-arch-build-depends' in item['policy_info']['build-depends']:
+            pm.unsatbuilddep = defaultdict(list)
+            for arch, packages in item['policy_info']['build-depends']['unsatisfiable-arch-build-depends'].items():
+                for p in packages:
+                    pm.unsatbuilddep[p].append(arch)
+        if 'implicit-deps' in item['policy_info']['implicit-deps']:
+            pm.brokenbin = item['policy_info']['implicit-deps']['implicit-deps']['broken-binaries']
+
+        first_entry = None
+        pkg_subset = set(itertools.chain([source_package_name],pm.blocked_by,pm.migrate_after,pm.regressions.keys()))
+        for pkg_set in package_sets[:]:
+            if pkg_set.isdisjoint(pkg_subset):
+                continue
+            if first_entry is None:
+                first_entry = pkg_set
+            else:
+                first_entry.update(pkg_set)
+                package_sets.remove(pkg_set)
+        if first_entry:
+            first_entry.update(pkg_subset)
+        else:
+            package_sets.append(pkg_subset)
+
+    if filter_packages:
+        package_sets = [s for s in package_sets if not s.isdisjoint(filter_packages)]
+    
+    package_set_small = [s for s in package_sets if len(s) <= args.small_group_size]
+
+    for pkg in package_set_small:
+        package_sets.remove(pkg)
+
+    package_set_small.sort(key=len)
+    package_sets.sort(key=len)
+
+    print("rendering")
+    with open(args.output, 'w', encoding='utf-8') as fp:
+        fp.write("digraph proposed_migration {\n")
+        fp.write(" splines=true;\n")
+        if package_set_small:
+            pkgs_in_cluster = [pkg for pkg_set in package_set_small for pkg in pkg_set.intersection(filter_packages)]
+            cluster_name = ",".join(pkgs_in_cluster)
+            fp.write(" subgraph cluster_small {{\n  label=\"Cluster (<{} nodes) {}\";\n".format(args.small_group_size,cluster_name))
+            for pkg_set in package_set_small:
+                for pkg_name in pkg_set:
+                    if pkg_name not in migrations:
+                        continue
+                    write_package_migration(migrations[pkg_name],fp)
+            fp.write(" }\n\n")
+
+        for i in range(len(package_sets)):
+            pkg_set = package_sets[i]
+            pkgs_in_cluster = pkg_set.intersection(filter_packages)
+            cluster_number = "{:04}".format(i)
+            cluster_name = ",".join(pkgs_in_cluster) if pkgs_in_cluster else cluster_number
+            fp.write(" subgraph cluster_{} {{\n  label=\"Cluster {}\";\n".format(cluster_number,cluster_name))
+            for pkg_name in pkg_set:
+                if pkg_name not in migrations:
+                    continue
+                write_package_migration(migrations[pkg_name],fp)
+            fp.write(" }\n\n")
+
+        fp.write("}")
+
+if __name__ == '__main__':
+    main()
